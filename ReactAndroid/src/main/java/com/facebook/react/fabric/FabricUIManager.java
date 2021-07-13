@@ -34,7 +34,7 @@ import com.facebook.common.logging.FLog;
 import com.facebook.debug.holder.PrinterHolder;
 import com.facebook.debug.tags.ReactDebugOverlayTags;
 import com.facebook.infer.annotation.ThreadConfined;
-import com.facebook.proguard.annotations.DoNotStrip;
+import com.facebook.proguard.annotations.DoNotStripAny;
 import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.NativeArray;
 import com.facebook.react.bridge.NativeMap;
@@ -42,7 +42,6 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReactMarker;
 import com.facebook.react.bridge.ReactMarkerConstants;
-import com.facebook.react.bridge.ReactNoCrashSoftException;
 import com.facebook.react.bridge.ReactSoftException;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
@@ -79,14 +78,21 @@ import com.facebook.react.uimanager.ViewManagerPropertyUpdater;
 import com.facebook.react.uimanager.ViewManagerRegistry;
 import com.facebook.react.uimanager.events.EventDispatcher;
 import com.facebook.react.uimanager.events.EventDispatcherImpl;
+import com.facebook.react.uimanager.events.LockFreeEventDispatcherImpl;
 import com.facebook.react.views.text.TextLayoutManager;
 import com.facebook.react.views.text.TextLayoutManagerMapBuffer;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+/**
+ * We instruct ProGuard not to strip out any fields or methods, because many of these methods are
+ * only called through the JNI from Cxx so it appears that most of this class is "unused".
+ */
 @SuppressLint("MissingNativeLoadLibrary")
+@DoNotStripAny
 public class FabricUIManager implements UIManager, LifecycleEventListener {
   public static final String TAG = FabricUIManager.class.getSimpleName();
 
@@ -140,6 +146,16 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
   // from C++ to exceed 9,999 and it should be obvious what's going on when analyzing performance.
   private int mCurrentSynchronousCommitNumber = 10000;
 
+  private MountingManager.MountItemExecutor mMountItemExecutor =
+      new MountingManager.MountItemExecutor() {
+        @Override
+        public void executeItems(Queue<MountItem> items) {
+          // This executor can be technically accessed before the dispatcher is created,
+          // but if that happens, something is terribly wrong
+          mMountItemDispatcher.dispatchMountItems(items);
+        }
+      };
+
   // TODO T83943316: Deprecate and delete this constructor once StaticViewConfigs are enabled by
   // default
   public FabricUIManager(
@@ -149,7 +165,7 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
       EventBeatManager eventBeatManager) {
     mDispatchUIFrameCallback = new DispatchUIFrameCallback(reactContext);
     mReactApplicationContext = reactContext;
-    mMountingManager = new MountingManager(viewManagerRegistry);
+    mMountingManager = new MountingManager(viewManagerRegistry, mMountItemExecutor);
     mMountItemDispatcher =
         new MountItemDispatcher(mMountingManager, new MountItemDispatchListener());
     mEventDispatcher = eventDispatcher;
@@ -164,10 +180,13 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
       EventBeatManager eventBeatManager) {
     mDispatchUIFrameCallback = new DispatchUIFrameCallback(reactContext);
     mReactApplicationContext = reactContext;
-    mMountingManager = new MountingManager(viewManagerRegistry);
+    mMountingManager = new MountingManager(viewManagerRegistry, mMountItemExecutor);
     mMountItemDispatcher =
         new MountItemDispatcher(mMountingManager, new MountItemDispatchListener());
-    mEventDispatcher = new EventDispatcherImpl(reactContext);
+    mEventDispatcher =
+        ReactFeatureFlags.enableLockFreeEventDispatcher
+            ? new LockFreeEventDispatcherImpl(reactContext)
+            : new EventDispatcherImpl(reactContext);
     mShouldDeallocateEventDispatcher = true;
     mEventBeatManager = eventBeatManager;
     mReactApplicationContext.addLifecycleEventListener(this);
@@ -250,7 +269,26 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
     return rootTag;
   }
 
-  public void startSurface(final View rootView, SurfaceHandler surfaceHandler) {
+  public void startSurface(final SurfaceHandler surfaceHandler) {
+    int rootTag = ReactRootViewTagGenerator.getNextRootViewTag();
+    mMountingManager.startSurface(rootTag);
+
+    startSurfaceWithId(surfaceHandler, rootTag, false);
+  }
+
+  public void attachRootView(final View rootView, final SurfaceHandler surfaceHandler) {
+    ThemedReactContext reactContext =
+        new ThemedReactContext(
+            mReactApplicationContext,
+            rootView.getContext(),
+            surfaceHandler.getModuleName(),
+            surfaceHandler.getSurfaceId());
+    mMountingManager.attachRootView(surfaceHandler.getSurfaceId(), rootView, reactContext);
+
+    surfaceHandler.setMountable(true);
+  }
+
+  public void startSurfaceWithView(final View rootView, final SurfaceHandler surfaceHandler) {
     final int rootTag = ReactRootViewTagGenerator.getNextRootViewTag();
 
     Context context = rootView.getContext();
@@ -259,14 +297,19 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
             mReactApplicationContext, context, surfaceHandler.getModuleName(), rootTag);
     mMountingManager.startSurface(rootTag, rootView, reactContext);
 
+    startSurfaceWithId(surfaceHandler, rootTag, true);
+  }
+
+  private void startSurfaceWithId(SurfaceHandler surfaceHandler, int rootTag, boolean isMountable) {
     surfaceHandler.setSurfaceId(rootTag);
     if (surfaceHandler instanceof SurfaceHandlerBinding) {
       mBinding.registerSurface((SurfaceHandlerBinding) surfaceHandler);
     }
+    surfaceHandler.setMountable(isMountable);
     surfaceHandler.start();
   }
 
-  public void stopSurface(SurfaceHandler surfaceHandler) {
+  public void stopSurface(final SurfaceHandler surfaceHandler) {
     if (!surfaceHandler.isRunning()) {
       ReactSoftException.logSoftException(
           FabricUIManager.TAG,
@@ -284,7 +327,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
   }
 
   /** Method called when an event has been dispatched on the C++ side. */
-  @DoNotStrip
   @SuppressWarnings("unused")
   public void onRequestEventBeat() {
     mEventDispatcher.dispatchAllEvents();
@@ -356,7 +398,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
     }
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   private NativeArray measureLines(
       ReadableMap attributedString, ReadableMap paragraphAttributes, float width, float height) {
@@ -368,7 +409,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
             PixelUtil.toPixelFromDIP(width));
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   private NativeArray measureLinesMapBuffer(
       ReadableMapBuffer attributedString,
@@ -383,7 +423,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
             PixelUtil.toPixelFromDIP(width));
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   private long measure(
       int rootTag,
@@ -408,7 +447,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
         null);
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   private long measure(
       int surfaceId,
@@ -447,7 +485,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
         attachmentsPositions);
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   private long measureMapBuffer(
       int surfaceId,
@@ -491,7 +528,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
    *     padding used by RN Android TextInput.
    * @return if theme data is available in the output parameters.
    */
-  @DoNotStrip
   public boolean getThemeData(int surfaceId, float[] defaultTextInputPadding) {
     SurfaceMountingManager surfaceMountingManager =
         mMountingManager.getSurfaceManagerEnforced(surfaceId, "getThemeData");
@@ -552,11 +588,12 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
             try {
               mountingManager.updateProps(reactTag, props);
             } catch (Exception ex) {
-              // TODO T42943890: Fix animations in Fabric and remove this try/catch
-              ReactSoftException.logSoftException(
-                  TAG,
-                  new ReactNoCrashSoftException(
-                      "Caught exception in synchronouslyUpdateViewOnUIThread", ex));
+              // TODO T42943890: Fix animations in Fabric and remove this try/catch?
+              // There might always be race conditions between surface teardown and
+              // animations/other operations, so it may not be feasible to remove this.
+              // Practically 100% of reported errors from this point are because the
+              // surface has stopped by this point, but the MountItem was queued before
+              // the surface was stopped. It's likely not feasible to prevent all such races.
             }
           }
 
@@ -590,7 +627,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
         ReactMarkerConstants.FABRIC_UPDATE_UI_MAIN_THREAD_END, null, commitNumber);
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   @AnyThread
   @ThreadConfined(ANY)
@@ -600,6 +636,7 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
       final String componentName,
       @Nullable ReadableMap props,
       @Nullable Object stateWrapper,
+      @Nullable Object eventEmitterWrapper,
       boolean isLayoutable) {
 
     mMountItemDispatcher.addPreAllocateMountItem(
@@ -609,10 +646,10 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
             getFabricComponentName(componentName),
             props,
             (StateWrapper) stateWrapper,
+            (EventEmitterWrapper) eventEmitterWrapper,
             isLayoutable));
   }
 
-  @DoNotStrip
   @SuppressWarnings("unused")
   @AnyThread
   @ThreadConfined(ANY)
@@ -626,7 +663,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
    * to enforce execution order using {@link ReactChoreographer.CallbackType}. This method should
    * only be called as the result of a new tree being committed.
    */
-  @DoNotStrip
   @SuppressWarnings("unused")
   @AnyThread
   @ThreadConfined(ANY)
@@ -756,8 +792,37 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
   @Override
   public void receiveEvent(
       int surfaceId, int reactTag, String eventName, @Nullable WritableMap params) {
+    receiveEvent(surfaceId, reactTag, eventName, false, 0, params);
+  }
+
+  /**
+   * receiveEvent API that emits an event to C++. If `canCoalesceEvent` is true, that signals that
+   * C++ may coalesce the event optionally. Otherwise, coalescing can happen in Java before
+   * emitting.
+   *
+   * <p>`customCoalesceKey` is currently unused.
+   *
+   * @param surfaceId
+   * @param reactTag
+   * @param eventName
+   * @param canCoalesceEvent
+   * @param customCoalesceKey
+   * @param params
+   */
+  public void receiveEvent(
+      int surfaceId,
+      int reactTag,
+      String eventName,
+      boolean canCoalesceEvent,
+      int customCoalesceKey,
+      @Nullable WritableMap params) {
     if (ReactBuildConfig.DEBUG && surfaceId == View.NO_ID) {
       FLog.d(TAG, "Emitted event without surfaceId: [%d] %s", reactTag, eventName);
+    }
+
+    if (mDestroyed) {
+      FLog.e(TAG, "Attempted to receiveEvent after destruction");
+      return;
     }
 
     EventEmitterWrapper eventEmitter = mMountingManager.getEventEmitter(surfaceId, reactTag);
@@ -768,7 +833,11 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
       return;
     }
 
-    eventEmitter.invoke(eventName, params);
+    if (canCoalesceEvent) {
+      eventEmitter.invokeUnique(eventName, params, customCoalesceKey);
+    } else {
+      eventEmitter.invoke(eventName, params);
+    }
   }
 
   @Override
@@ -825,7 +894,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
         new DispatchIntCommandMountItem(surfaceId, reactTag, commandId, commandArgs));
   }
 
-  @DoNotStrip
   @AnyThread
   @ThreadConfined(ANY)
   public void dispatchCommand(
@@ -846,7 +914,6 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
     mMountItemDispatcher.addMountItem(new SendAccessibilityEvent(View.NO_ID, reactTag, eventType));
   }
 
-  @DoNotStrip
   @AnyThread
   @ThreadConfined(ANY)
   public void sendAccessibilityEventFromJS(int surfaceId, int reactTag, String eventTypeJS) {
@@ -871,56 +938,50 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
    * @param initialReactTag React tag of the JS view that initiated the touch operation
    * @param blockNativeResponder If native responder should be blocked or not
    */
-  @DoNotStrip
   public void setJSResponder(
       final int surfaceId,
       final int reactTag,
       final int initialReactTag,
       final boolean blockNativeResponder) {
-    if (ReactFeatureFlags.enableJSResponder) {
-      mMountItemDispatcher.addMountItem(
-          new MountItem() {
-            @Override
-            public void execute(MountingManager mountingManager) {
-              SurfaceMountingManager surfaceMountingManager =
-                  mountingManager.getSurfaceManager(surfaceId);
-              if (surfaceMountingManager != null) {
-                surfaceMountingManager.setJSResponder(
-                    reactTag, initialReactTag, blockNativeResponder);
-              } else {
-                FLog.e(
-                    TAG, "setJSResponder skipped, surface no longer available [" + surfaceId + "]");
-              }
+    mMountItemDispatcher.addMountItem(
+        new MountItem() {
+          @Override
+          public void execute(MountingManager mountingManager) {
+            SurfaceMountingManager surfaceMountingManager =
+                mountingManager.getSurfaceManager(surfaceId);
+            if (surfaceMountingManager != null) {
+              surfaceMountingManager.setJSResponder(
+                  reactTag, initialReactTag, blockNativeResponder);
+            } else {
+              FLog.e(
+                  TAG, "setJSResponder skipped, surface no longer available [" + surfaceId + "]");
             }
+          }
 
-            @Override
-            public int getSurfaceId() {
-              return surfaceId;
-            }
-          });
-    }
+          @Override
+          public int getSurfaceId() {
+            return surfaceId;
+          }
+        });
   }
 
   /**
    * Clears the JS Responder specified by {@link #setJSResponder}. After this method is called, all
    * the touch events are going to be handled by JS.
    */
-  @DoNotStrip
   public void clearJSResponder() {
-    if (ReactFeatureFlags.enableJSResponder) {
-      mMountItemDispatcher.addMountItem(
-          new MountItem() {
-            @Override
-            public void execute(MountingManager mountingManager) {
-              mountingManager.clearJSResponder();
-            }
+    mMountItemDispatcher.addMountItem(
+        new MountItem() {
+          @Override
+          public void execute(MountingManager mountingManager) {
+            mountingManager.clearJSResponder();
+          }
 
-            @Override
-            public int getSurfaceId() {
-              return View.NO_ID;
-            }
-          });
-    }
+          @Override
+          public int getSurfaceId() {
+            return View.NO_ID;
+          }
+        });
   }
 
   @Override
@@ -942,14 +1003,12 @@ public class FabricUIManager implements UIManager, LifecycleEventListener {
   }
 
   // Called from Binding.cpp
-  @DoNotStrip
   @AnyThread
   public void onAnimationStarted() {
     mDriveCxxAnimations = true;
   }
 
   // Called from Binding.cpp
-  @DoNotStrip
   @AnyThread
   public void onAllAnimationsComplete() {
     mDriveCxxAnimations = false;

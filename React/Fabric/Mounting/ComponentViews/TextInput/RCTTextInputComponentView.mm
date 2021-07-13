@@ -258,6 +258,7 @@ using namespace facebook::react;
   _lastStringStateWasUpdatedWith = nil;
   _ignoreNextTextInputCall = NO;
   _didMoveToWindow = NO;
+  [_backedTextInputView resignFirstResponder];
 }
 
 #pragma mark - RCTBackedTextInputDelegate
@@ -335,6 +336,15 @@ using namespace facebook::react;
   if (props.maxLength) {
     NSInteger allowedLength = props.maxLength - _backedTextInputView.attributedText.string.length + range.length;
 
+    if (allowedLength > 0 && text.length > allowedLength) {
+      // make sure unicode characters that are longer than 16 bits (such as emojis) are not cut off
+      NSRange cutOffCharacterRange = [text rangeOfComposedCharacterSequenceAtIndex:allowedLength - 1];
+      if (cutOffCharacterRange.location + cutOffCharacterRange.length > allowedLength) {
+        // the character at the length limit takes more than 16bits, truncation should end at the character before
+        allowedLength = cutOffCharacterRange.location;
+      }
+    }
+
     if (allowedLength <= 0) {
       return nil;
     }
@@ -356,7 +366,7 @@ using namespace facebook::react;
     return;
   }
 
-  if (_ignoreNextTextInputCall) {
+  if (_ignoreNextTextInputCall && [_lastStringStateWasUpdatedWith isEqual:_backedTextInputView.attributedText]) {
     _ignoreNextTextInputCall = NO;
     return;
   }
@@ -411,11 +421,9 @@ using namespace facebook::react;
   }
   _comingFromJS = YES;
   if (![value isEqualToString:_backedTextInputView.attributedText.string]) {
-    NSMutableAttributedString *mutableString =
-        [[NSMutableAttributedString alloc] initWithAttributedString:_backedTextInputView.attributedText];
-    [mutableString replaceCharactersInRange:NSMakeRange(0, _backedTextInputView.attributedText.length)
-                                 withString:value];
-    [self _setAttributedString:mutableString];
+    NSAttributedString *attributedString =
+        [[NSAttributedString alloc] initWithString:value attributes:_backedTextInputView.defaultTextAttributes];
+    [self _setAttributedString:attributedString];
     [self _updateState];
   }
 
@@ -435,6 +443,14 @@ using namespace facebook::react;
 
 - (void)setDefaultInputAccessoryView
 {
+  // InputAccessoryView component sets the inputAccessoryView when inputAccessoryViewID exists
+  if (_backedTextInputView.inputAccessoryViewID) {
+    if (_backedTextInputView.isFirstResponder) {
+      [_backedTextInputView reloadInputViews];
+    }
+    return;
+  }
+
   UIKeyboardType keyboardType = _backedTextInputView.keyboardType;
 
   // These keyboard types (all are number pads) don't have a "Done" button by default,

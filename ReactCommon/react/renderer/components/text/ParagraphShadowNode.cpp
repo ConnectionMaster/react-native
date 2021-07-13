@@ -14,6 +14,7 @@
 #include <react/renderer/components/view/ViewShadowNode.h>
 #include <react/renderer/components/view/conversions.h>
 #include <react/renderer/graphics/rounding.h>
+#include <react/renderer/telemetry/TransactionTelemetry.h>
 
 #include "ParagraphState.h"
 
@@ -77,8 +78,8 @@ Content ParagraphShadowNode::getContentWithMeasuredAttachments(
         laytableShadowNode->measure(layoutContext, localLayoutConstraints);
 
     // Rounding to *next* value on the pixel grid.
-    size.width += 0.01;
-    size.height += 0.01;
+    size.width += 0.01f;
+    size.height += 0.01f;
     size = roundToPixel<&ceil>(size, layoutContext.pointScaleFactor);
 
     auto fragmentLayoutMetrics = LayoutMetrics{};
@@ -185,7 +186,7 @@ void ParagraphShadowNode::layout(LayoutContext layoutContext) {
   react_native_assert(
       content.attachments.size() == measurement.attachments.size());
 
-  for (auto i = 0; i < content.attachments.size(); i++) {
+  for (size_t i = 0; i < content.attachments.size(); i++) {
     auto &attachment = content.attachments.at(i);
 
     if (!traitCast<LayoutableShadowNode const *>(attachment.shadowNode)) {
